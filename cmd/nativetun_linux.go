@@ -82,7 +82,8 @@ var nativeTunCmd = &cobra.Command{
 		}
 
 		var endpoint *net.UDPAddr
-		if ipv6, err := cmd.Flags().GetBool("ipv6"); err == nil && !ipv6 {
+		ipv6, err := cmd.Flags().GetBool("ipv6")
+		if err == nil && !ipv6 {
 			endpoint = &net.UDPAddr{
 				IP:   net.ParseIP(config.AppConfig.EndpointV4),
 				Port: connectPort,
@@ -126,14 +127,6 @@ var nativeTunCmd = &cobra.Command{
 			cmd.Printf("Failed to get reconnect delay: %v\n", err)
 			return
 		}
-		links, err := netlink.LinkList()
-		if err != nil {
-			log.Fatalf("failed to get links list: %v", err)
-		}
-		for i, link := range links {
-			log.Printf("Link #%d: %s\n", i, link.Attrs())
-		}
-
 		dev, err := water.New(water.Config{DeviceType: water.TUN})
 		if err != nil {
 			log.Println("Are you root/administrator? TUN device creation usually requires elevated privileges.")
@@ -172,46 +165,14 @@ var nativeTunCmd = &cobra.Command{
 			if err := netlink.LinkSetUp(link); err != nil {
 				log.Fatalf("failed to set link up: %v", err)
 			}
-			if !noTunnelIPv4 {
+			if !ipv6 {
 				routeV4, err := getDefaultRoute(netlink.FAMILY_V4)
 				if routeV4 != nil {
-					log.Printf("Found default route for IPv4 address: %v", routeV4)
-					mask := net.CIDRMask(32, 32)
-					if !isIPv4(endpoint.IP) {
-						mask = net.CIDRMask(128, 128)
-					}
-					err := netlink.RouteAdd(&netlink.Route{
-						LinkIndex: routeV4.LinkIndex,
-						Gw:        routeV4.Gw,
-						Dst: &net.IPNet{
-							IP:   endpoint.IP,
-							Mask: mask,
-						},
-					})
-					if err != nil && !errors.Is(err, syscall.EEXIST) {
-						log.Fatalf("failed to add route: %v", err)
-					}
-					err = netlink.RouteAdd(&netlink.Route{
-						LinkIndex: link.Attrs().Index,
-						Scope:     netlink.SCOPE_LINK,
-						Dst:       CIDR("128.0.0.0/1"),
-					})
-					if err != nil && !errors.Is(err, syscall.EEXIST) {
-						log.Fatalf("failed to add route: %v", err)
-					}
-					err = netlink.RouteAdd(&netlink.Route{
-						LinkIndex: link.Attrs().Index,
-						Scope:     netlink.SCOPE_LINK,
-						Dst:       CIDR("0.0.0.0/1"),
-					})
-					if err != nil && !errors.Is(err, syscall.EEXIST) {
-						log.Fatalf("failed to add route: %v", err)
-					}
+					addRouteV4(routeV4, endpoint, link)
 				} else {
 					log.Printf("failed to get default route for ipv4: %v", err)
 				}
-			}
-			if !noTunnelIPv6 {
+			} else {
 				routeV6, err := getDefaultRoute(netlink.FAMILY_V6)
 
 				if routeV6 != nil {
@@ -219,7 +180,6 @@ var nativeTunCmd = &cobra.Command{
 				} else {
 					log.Printf("failed to get default route for ipv6: %v", err)
 				}
-
 			}
 			log.Println("Skipping IP address and link setup. You should set the link up manually.")
 			log.Println("Config has the following IP addresses:")
@@ -235,9 +195,36 @@ var nativeTunCmd = &cobra.Command{
 	},
 }
 
-func isIPv4(ip net.IP) bool {
-	return ip.To4() != nil
+func addRouteV4(routeV4 *netlink.Route, endpoint *net.UDPAddr, link netlink.Link) {
+	log.Printf("Found default route for IPv4 address: %v", routeV4)
+	if err := netlink.RouteAdd(&netlink.Route{
+		LinkIndex: routeV4.LinkIndex,
+		Gw:        routeV4.Gw,
+		Dst: &net.IPNet{
+			IP:   endpoint.IP,
+			Mask: net.CIDRMask(32, 32),
+		},
+	}); err != nil && !errors.Is(err, syscall.EEXIST) {
+		log.Fatalf("failed to add route: %v", err)
+	}
+
+	if err := netlink.RouteAdd(&netlink.Route{
+		LinkIndex: link.Attrs().Index,
+		Scope:     netlink.SCOPE_LINK,
+		Dst:       CIDR("128.0.0.0/1"),
+	}); err != nil && !errors.Is(err, syscall.EEXIST) {
+		log.Fatalf("failed to add route: %v", err)
+	}
+
+	if err := netlink.RouteAdd(&netlink.Route{
+		LinkIndex: link.Attrs().Index,
+		Scope:     netlink.SCOPE_LINK,
+		Dst:       CIDR("0.0.0.0/1"),
+	}); err != nil && !errors.Is(err, syscall.EEXIST) {
+		log.Fatalf("failed to add route: %v", err)
+	}
 }
+
 func isZeroMask(mask net.IPMask) bool {
 	if mask == nil {
 		return false
@@ -262,8 +249,17 @@ func getDefaultRoute(family int) (*netlink.Route, error) {
 			return &route, nil
 		}
 	}
-
-	return nil, fmt.Errorf("no default route found (family %d)", family)
+	var familyStr string
+	if family == netlink.FAMILY_V4 {
+		familyStr = "ipv4"
+	} else if family == netlink.FAMILY_V6 {
+		familyStr = "ipv6"
+	} else if family == netlink.FAMILY_MPLS {
+		familyStr = "mpls"
+	} else {
+		familyStr = "all"
+	}
+	return nil, fmt.Errorf("no default route found (family %s)", familyStr)
 }
 func CIDR(cidr string) *net.IPNet {
 	_, i, err := net.ParseCIDR(cidr)
