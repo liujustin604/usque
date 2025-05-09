@@ -4,9 +4,12 @@ package cmd
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"net"
 	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/Diniboy1123/usque/api"
@@ -91,13 +94,13 @@ var nativeTunCmd = &cobra.Command{
 			}
 		}
 
-		tunnelIPv4, err := cmd.Flags().GetBool("no-tunnel-ipv4")
+		noTunnelIPv4, err := cmd.Flags().GetBool("no-tunnel-ipv4")
 		if err != nil {
 			cmd.Printf("Failed to get no tunnel IPv4: %v\n", err)
 			return
 		}
 
-		tunnelIPv6, err := cmd.Flags().GetBool("no-tunnel-ipv6")
+		noTunnelIPv6, err := cmd.Flags().GetBool("no-tunnel-ipv6")
 		if err != nil {
 			cmd.Printf("Failed to get no tunnel IPv6: %v\n", err)
 			return
@@ -123,6 +126,13 @@ var nativeTunCmd = &cobra.Command{
 			cmd.Printf("Failed to get reconnect delay: %v\n", err)
 			return
 		}
+		links, err := netlink.LinkList()
+		if err != nil {
+			log.Fatalf("failed to get links list: %v", err)
+		}
+		for i, link := range links {
+			log.Printf("Link #%d: %s\n", i, link.Attrs())
+		}
 
 		dev, err := water.New(water.Config{DeviceType: water.TUN})
 		if err != nil {
@@ -141,7 +151,7 @@ var nativeTunCmd = &cobra.Command{
 			if err := netlink.LinkSetMTU(link, mtu); err != nil {
 				log.Fatalf("failed to set MTU: %v", err)
 			}
-			if !tunnelIPv4 {
+			if !noTunnelIPv4 {
 				if err := netlink.AddrAdd(link, &netlink.Addr{
 					IPNet: &net.IPNet{
 						IP:   net.ParseIP(config.AppConfig.IPv4),
@@ -150,7 +160,7 @@ var nativeTunCmd = &cobra.Command{
 					log.Fatalf("failed to add address: %v", err)
 				}
 			}
-			if !tunnelIPv6 {
+			if !noTunnelIPv6 {
 				if err := netlink.AddrAdd(link, &netlink.Addr{
 					IPNet: &net.IPNet{
 						IP:   net.ParseIP(config.AppConfig.IPv6),
@@ -162,7 +172,55 @@ var nativeTunCmd = &cobra.Command{
 			if err := netlink.LinkSetUp(link); err != nil {
 				log.Fatalf("failed to set link up: %v", err)
 			}
-		} else {
+			if !noTunnelIPv4 {
+				routeV4, err := getDefaultRoute(netlink.FAMILY_V4)
+				if routeV4 != nil {
+					log.Printf("Found default route for IPv4 address: %v", routeV4)
+					mask := net.CIDRMask(32, 32)
+					if !isIPv4(endpoint.IP) {
+						mask = net.CIDRMask(128, 128)
+					}
+					err := netlink.RouteAdd(&netlink.Route{
+						LinkIndex: routeV4.LinkIndex,
+						Gw:        routeV4.Gw,
+						Dst: &net.IPNet{
+							IP:   endpoint.IP,
+							Mask: mask,
+						},
+					})
+					if err != nil && !errors.Is(err, syscall.EEXIST) {
+						log.Fatalf("failed to add route: %v", err)
+					}
+					err = netlink.RouteAdd(&netlink.Route{
+						LinkIndex: link.Attrs().Index,
+						Scope:     netlink.SCOPE_LINK,
+						Dst:       CIDR("128.0.0.0/1"),
+					})
+					if err != nil && !errors.Is(err, syscall.EEXIST) {
+						log.Fatalf("failed to add route: %v", err)
+					}
+					err = netlink.RouteAdd(&netlink.Route{
+						LinkIndex: link.Attrs().Index,
+						Scope:     netlink.SCOPE_LINK,
+						Dst:       CIDR("0.0.0.0/1"),
+					})
+					if err != nil && !errors.Is(err, syscall.EEXIST) {
+						log.Fatalf("failed to add route: %v", err)
+					}
+				} else {
+					log.Printf("failed to get default route for ipv4: %v", err)
+				}
+			}
+			if !noTunnelIPv6 {
+				routeV6, err := getDefaultRoute(netlink.FAMILY_V6)
+
+				if routeV6 != nil {
+					// I don't have access to ipv6, so I can't implement it while making sure it works
+				} else {
+					log.Printf("failed to get default route for ipv6: %v", err)
+				}
+
+			}
 			log.Println("Skipping IP address and link setup. You should set the link up manually.")
 			log.Println("Config has the following IP addresses:")
 			log.Printf("IPv4: %s", config.AppConfig.IPv4)
@@ -177,6 +235,43 @@ var nativeTunCmd = &cobra.Command{
 	},
 }
 
+func isIPv4(ip net.IP) bool {
+	return ip.To4() != nil
+}
+func isZeroMask(mask net.IPMask) bool {
+	if mask == nil {
+		return false
+	}
+	for _, b := range mask {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+func getDefaultRoute(family int) (*netlink.Route, error) {
+	routes, err := netlink.RouteList(nil, family)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list routes (family %d): %w", family, err)
+	}
+	for _, route := range routes {
+		if route.Dst == nil {
+			return &route, nil
+		}
+		if route.Dst.IP.IsUnspecified() && isZeroMask(route.Dst.Mask) {
+			return &route, nil
+		}
+	}
+
+	return nil, fmt.Errorf("no default route found (family %d)", family)
+}
+func CIDR(cidr string) *net.IPNet {
+	_, i, err := net.ParseCIDR(cidr)
+	if err != nil {
+		log.Fatalf("failed parse CIDR: %v", err)
+	}
+	return i
+}
 func init() {
 	nativeTunCmd.Flags().IntP("connect-port", "P", 443, "Used port for MASQUE connection")
 	nativeTunCmd.Flags().BoolP("ipv6", "6", false, "Use IPv6 for MASQUE connection")
